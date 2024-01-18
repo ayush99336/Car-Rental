@@ -1,0 +1,26 @@
+.bg-image {
+  position: absolute;
+  right: 0;
+  top: 0;
+  z-index: 0;
+  background-image: url("./assets/home/home-bg.png");
+  width: 100%;
+}
+input {
+  padding: 0.2em;
+  box-sizing: border-box;
+  width: 100%;
+}
+.scroll-bar::-webkit-scrollbar {
+  width: 8px; /* width of the entire scrollbar */
+}
+
+.scroll-bar::-webkit-scrollbar-track {
+  background: rgb(255, 255, 255); /* color of the tracking area */
+}
+
+.scroll-bar::-webkit-scrollbar-thumb {
+  background-color: #ff4d30; /* color of the scroll thumb */
+  border-radius: 20px; /* roundness of the scroll thumb */
+  /* border: 3px solid orange;  creates padding around scroll thumb */
+}
