@@ -2,7 +2,8 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 
 const API_URL = "https://fcapi.amitbala1993.workers.dev";
 const HLS_SCRIPT_URL = "https://cdn.jsdelivr.net/npm/hls.js@latest";
-const REFRESH_INTERVAL_MS = 60_000;
+const HLS_PROXY_URL = process.env.REACT_APP_HLS_PROXY_URL || "http://localhost:4001";
+const REFRESH_INTERVAL_MS = 8 * 60 * 1000;
 
 const formatTime = (seconds) => {
   if (!Number.isFinite(seconds) || seconds < 0) return "00:00";
@@ -18,6 +19,11 @@ const getDefaultQuality = (match) => {
   if (!match?.all_resolutions) return "";
   if (match.all_resolutions["1080p"]) return "1080p";
   return Object.keys(match.all_resolutions)[0] || "";
+};
+
+const createProxyUrl = (rawUrl) => {
+  if (!rawUrl) return "";
+  return `${HLS_PROXY_URL}/hls?url=${encodeURIComponent(rawUrl)}`;
 };
 
 const loadHlsScript = () =>
@@ -42,14 +48,10 @@ const loadHlsScript = () =>
     document.body.appendChild(script);
   });
 
-const createProxyUrl = (rawUrl) => {
-  if (!rawUrl) return "";
-  return `${API_URL}/proxy?url=${encodeURIComponent(rawUrl)}`;
-};
-
 export default function FanCodeDashboard() {
   const videoRef = useRef(null);
   const hlsRef = useRef(null);
+  const fallbackRef = useRef({ streamUrl: "", attempts: 0 });
 
   const [data, setData] = useState(null);
   const [isLoading, setIsLoading] = useState(true);
@@ -59,7 +61,6 @@ export default function FanCodeDashboard() {
   const [selectedMatchId, setSelectedMatchId] = useState("");
   const [quality, setQuality] = useState("");
   const [streamUrl, setStreamUrl] = useState("");
-  const [useWorkerProxy, setUseWorkerProxy] = useState(true);
 
   const [playbackError, setPlaybackError] = useState("");
   const [currentTime, setCurrentTime] = useState(0);
@@ -75,6 +76,7 @@ export default function FanCodeDashboard() {
 
       const response = await fetch(API_URL, {
         signal: controller.signal,
+        cache: "no-store",
         headers: { Accept: "application/json" },
       });
 
@@ -130,18 +132,52 @@ export default function FanCodeDashboard() {
       .sort((a, b) => Number.parseInt(a.label, 10) - Number.parseInt(b.label, 10));
   }, [selectedMatch]);
 
+  const activeQuality = useMemo(() => {
+    if (!selectedMatch) return "";
+    if (quality && selectedMatch.all_resolutions?.[quality]) return quality;
+    return getDefaultQuality(selectedMatch);
+  }, [quality, selectedMatch]);
+
+  const selectedStreamSource = useMemo(() => {
+    if (!selectedMatch) return "";
+
+    return selectedMatch.all_resolutions?.[activeQuality] || selectedMatch.stream_url || "";
+  }, [activeQuality, selectedMatch]);
+
+  const fallbackToLowerQuality = useCallback(() => {
+    if (!qualities.length) return false;
+
+    const labels = qualities.map((item) => item.label);
+    const selectedIndex = labels.indexOf(quality);
+    const startIndex = selectedIndex === -1 ? labels.length - 1 : selectedIndex;
+
+    for (let index = startIndex - 1; index >= 0; index -= 1) {
+      const lowerLabel = labels[index];
+      if (lowerLabel && lowerLabel !== quality) {
+        setQuality(lowerLabel);
+        return true;
+      }
+    }
+
+    return false;
+  }, [qualities, quality]);
+
   useEffect(() => {
-    if (!selectedMatch) return;
+    if (!selectedMatch || !activeQuality) return;
 
-    const nextQuality = selectedMatch.all_resolutions?.[quality] ? quality : getDefaultQuality(selectedMatch);
-    const rawUrl = selectedMatch.all_resolutions?.[nextQuality] || selectedMatch.stream_url || "";
+    if (activeQuality !== quality) {
+      setQuality(activeQuality);
+    }
+  }, [activeQuality, quality, selectedMatch]);
 
-    setQuality(nextQuality);
-    setStreamUrl(useWorkerProxy ? createProxyUrl(rawUrl) : rawUrl);
+  useEffect(() => {
+    if (!selectedStreamSource) return;
+
+    setStreamUrl(createProxyUrl(selectedStreamSource));
     setPlaybackError("");
     setCurrentTime(0);
     setDuration(0);
-  }, [quality, selectedMatch, useWorkerProxy]);
+  }, [selectedStreamSource]);
 
   useEffect(() => {
     const video = videoRef.current;
@@ -153,6 +189,10 @@ export default function FanCodeDashboard() {
       if (hlsRef.current) {
         hlsRef.current.destroy();
         hlsRef.current = null;
+      }
+
+      if (fallbackRef.current.streamUrl !== streamUrl) {
+        fallbackRef.current = { streamUrl, attempts: 0 };
       }
 
       const nativeHls = video.canPlayType("application/vnd.apple.mpegurl");
@@ -175,9 +215,18 @@ export default function FanCodeDashboard() {
 
         hls.on(Hls.Events.ERROR, async (_, detail) => {
           if (detail?.fatal) {
+            const status = detail?.response?.code || detail?.response?.status;
+            const canFallback = fallbackRef.current.attempts < 2;
+
+            if (status === 403 && canFallback && fallbackToLowerQuality()) {
+              fallbackRef.current.attempts += 1;
+              setPlaybackError("1080p is blocked for this stream right now. Switched to a lower quality.");
+              return;
+            }
+
             await fetchFeed(true);
             setPlaybackError(
-              "Stream token may have expired or source rejected. Feed auto-refreshed; if needed, switch quality or disable proxy mode."
+              "Stream token expired or source rejected the request. Feed refreshed automatically, please retry play."
             );
           }
         });
@@ -195,7 +244,7 @@ export default function FanCodeDashboard() {
         hlsRef.current = null;
       }
     };
-  }, [fetchFeed, streamUrl]);
+  }, [fallbackToLowerQuality, fetchFeed, streamUrl]);
 
   return (
     <main className="min-h-screen bg-slate-950 px-4 py-8 text-white md:px-8">
@@ -218,7 +267,17 @@ export default function FanCodeDashboard() {
                 className="aspect-video w-full"
                 onLoadedMetadata={(event) => setDuration(event.currentTarget.duration || 0)}
                 onTimeUpdate={(event) => setCurrentTime(event.currentTarget.currentTime || 0)}
-                onError={() => setPlaybackError("This stream could not be played. Try another quality or toggle proxy mode.")}
+                onError={() => {
+                  const canFallback = fallbackRef.current.attempts < 2;
+                  if (canFallback && fallbackToLowerQuality()) {
+                    fallbackRef.current.attempts += 1;
+                    setPlaybackError("Stream failed at current quality. Switched to a lower quality automatically.");
+                    return;
+                  }
+
+                  fetchFeed(true);
+                  setPlaybackError("This stream failed to load. Refreshed stream links automatically.");
+                }}
               />
             </div>
 
@@ -243,14 +302,6 @@ export default function FanCodeDashboard() {
                     </option>
                   ))}
                 </select>
-
-                <button
-                  type="button"
-                  onClick={() => setUseWorkerProxy((prev) => !prev)}
-                  className="rounded-md border border-slate-600 px-2 py-1 text-xs hover:bg-slate-800"
-                >
-                  Proxy: {useWorkerProxy ? "On" : "Off"}
-                </button>
 
                 <button
                   type="button"
