@@ -1,7 +1,8 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 const API_URL = "https://fcapi.amitbala1993.workers.dev";
 const HLS_SCRIPT_URL = "https://cdn.jsdelivr.net/npm/hls.js@latest";
+const REFRESH_INTERVAL_MS = 60_000;
 
 const formatTime = (seconds) => {
   if (!Number.isFinite(seconds) || seconds < 0) return "00:00";
@@ -41,68 +42,85 @@ const loadHlsScript = () =>
     document.body.appendChild(script);
   });
 
+const createProxyUrl = (rawUrl) => {
+  if (!rawUrl) return "";
+  return `${API_URL}/proxy?url=${encodeURIComponent(rawUrl)}`;
+};
+
 export default function FanCodeDashboard() {
   const videoRef = useRef(null);
   const hlsRef = useRef(null);
 
   const [data, setData] = useState(null);
   const [isLoading, setIsLoading] = useState(true);
+  const [isRefreshing, setIsRefreshing] = useState(false);
   const [fetchError, setFetchError] = useState("");
 
   const [selectedMatchId, setSelectedMatchId] = useState("");
   const [quality, setQuality] = useState("");
   const [streamUrl, setStreamUrl] = useState("");
+  const [useWorkerProxy, setUseWorkerProxy] = useState(true);
 
   const [playbackError, setPlaybackError] = useState("");
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
 
-  useEffect(() => {
+  const fetchFeed = useCallback(async (silent = false) => {
     const controller = new AbortController();
 
-    const fetchData = async () => {
-      try {
-        setIsLoading(true);
-        setFetchError("");
+    try {
+      if (!silent) setIsLoading(true);
+      setIsRefreshing(silent);
+      setFetchError("");
 
-        const response = await fetch(API_URL, {
-          signal: controller.signal,
-          headers: { Accept: "application/json" },
-        });
+      const response = await fetch(API_URL, {
+        signal: controller.signal,
+        headers: { Accept: "application/json" },
+      });
 
-        if (!response.ok) {
-          throw new Error(`API error: ${response.status}`);
-        }
-
-        const payload = await response.json();
-        setData(payload);
-
-        if (payload.matches?.length) {
-          const first = payload.matches[0];
-          const initialQuality = getDefaultQuality(first);
-          setSelectedMatchId(first.match_id);
-          setQuality(initialQuality);
-        }
-      } catch (error) {
-        if (error.name !== "AbortError") {
-          setFetchError("Could not load FanCode feed. Please refresh to try again.");
-        }
-      } finally {
-        setIsLoading(false);
+      if (!response.ok) {
+        throw new Error(`API error: ${response.status}`);
       }
-    };
 
-    fetchData();
+      const payload = await response.json();
+      setData(payload);
+
+      if (!selectedMatchId && payload.matches?.length) {
+        const first = payload.matches[0];
+        setSelectedMatchId(first.match_id);
+        setQuality(getDefaultQuality(first));
+      }
+    } catch (error) {
+      if (error.name !== "AbortError") {
+        setFetchError("Could not load FanCode feed. Please refresh to try again.");
+      }
+    } finally {
+      setIsLoading(false);
+      setIsRefreshing(false);
+    }
 
     return () => controller.abort();
-  }, []);
+  }, [selectedMatchId]);
+
+  useEffect(() => {
+    fetchFeed();
+  }, [fetchFeed]);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      fetchFeed(true);
+    }, REFRESH_INTERVAL_MS);
+
+    return () => window.clearInterval(timer);
+  }, [fetchFeed]);
 
   const liveMatches = useMemo(() => data?.matches || [], [data]);
   const upcomingMatches = useMemo(() => data?.upcoming_matches || [], [data]);
 
-  const selectedMatch = useMemo(() => {
-    return liveMatches.find((item) => String(item.match_id) === String(selectedMatchId)) || liveMatches[0] || null;
-  }, [liveMatches, selectedMatchId]);
+  const selectedMatch = useMemo(
+    () => liveMatches.find((item) => String(item.match_id) === String(selectedMatchId)) || liveMatches[0] || null,
+    [liveMatches, selectedMatchId]
+  );
 
   const qualities = useMemo(() => {
     if (!selectedMatch?.all_resolutions) return [];
@@ -115,19 +133,15 @@ export default function FanCodeDashboard() {
   useEffect(() => {
     if (!selectedMatch) return;
 
-    const nextQuality = getDefaultQuality(selectedMatch);
+    const nextQuality = selectedMatch.all_resolutions?.[quality] ? quality : getDefaultQuality(selectedMatch);
+    const rawUrl = selectedMatch.all_resolutions?.[nextQuality] || selectedMatch.stream_url || "";
 
     setQuality(nextQuality);
-    setStreamUrl(selectedMatch.all_resolutions?.[nextQuality] || selectedMatch.stream_url || "");
+    setStreamUrl(useWorkerProxy ? createProxyUrl(rawUrl) : rawUrl);
     setPlaybackError("");
     setCurrentTime(0);
     setDuration(0);
-  }, [selectedMatch]);
-
-  useEffect(() => {
-    if (!selectedMatch || !quality) return;
-    setStreamUrl(selectedMatch.all_resolutions?.[quality] || selectedMatch.stream_url || "");
-  }, [quality, selectedMatch]);
+  }, [quality, selectedMatch, useWorkerProxy]);
 
   useEffect(() => {
     const video = videoRef.current;
@@ -154,18 +168,17 @@ export default function FanCodeDashboard() {
           return;
         }
 
-        const hls = new Hls({
-          enableWorker: true,
-          lowLatencyMode: true,
-        });
-
+        const hls = new Hls({ enableWorker: true, lowLatencyMode: true });
         hlsRef.current = hls;
         hls.loadSource(streamUrl);
         hls.attachMedia(video);
 
-        hls.on(Hls.Events.ERROR, (_, detail) => {
+        hls.on(Hls.Events.ERROR, async (_, detail) => {
           if (detail?.fatal) {
-            setPlaybackError("Stream playback failed for this match right now. Please try another live match.");
+            await fetchFeed(true);
+            setPlaybackError(
+              "Stream token may have expired or source rejected. Feed auto-refreshed; if needed, switch quality or disable proxy mode."
+            );
           }
         });
       } catch {
@@ -182,7 +195,7 @@ export default function FanCodeDashboard() {
         hlsRef.current = null;
       }
     };
-  }, [streamUrl]);
+  }, [fetchFeed, streamUrl]);
 
   return (
     <main className="min-h-screen bg-slate-950 px-4 py-8 text-white md:px-8">
@@ -205,7 +218,7 @@ export default function FanCodeDashboard() {
                 className="aspect-video w-full"
                 onLoadedMetadata={(event) => setDuration(event.currentTarget.duration || 0)}
                 onTimeUpdate={(event) => setCurrentTime(event.currentTarget.currentTime || 0)}
-                onError={() => setPlaybackError("This stream could not be played. Try switching quality or another match.")}
+                onError={() => setPlaybackError("This stream could not be played. Try another quality or toggle proxy mode.")}
               />
             </div>
 
@@ -214,7 +227,7 @@ export default function FanCodeDashboard() {
                 {formatTime(currentTime)} / {formatTime(duration)}
               </p>
 
-              <div className="flex items-center gap-2">
+              <div className="flex flex-wrap items-center gap-2">
                 <label htmlFor="quality" className="text-sm text-slate-300">
                   Quality
                 </label>
@@ -230,6 +243,22 @@ export default function FanCodeDashboard() {
                     </option>
                   ))}
                 </select>
+
+                <button
+                  type="button"
+                  onClick={() => setUseWorkerProxy((prev) => !prev)}
+                  className="rounded-md border border-slate-600 px-2 py-1 text-xs hover:bg-slate-800"
+                >
+                  Proxy: {useWorkerProxy ? "On" : "Off"}
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => fetchFeed(true)}
+                  className="rounded-md border border-slate-600 px-2 py-1 text-xs hover:bg-slate-800"
+                >
+                  {isRefreshing ? "Refreshing..." : "Refresh feed"}
+                </button>
               </div>
             </div>
 
