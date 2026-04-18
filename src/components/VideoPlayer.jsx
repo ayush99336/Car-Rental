@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
+import Hls from "hls.js";
 
 const API_URL = "https://fcapi.amitbala1993.workers.dev";
 
@@ -27,6 +28,7 @@ const pickDefaultStream = (match) => {
 
 export default function VideoPlayer() {
   const playerRef = useRef(null);
+  const hlsRef = useRef(null);
 
   const [apiData, setApiData] = useState(null);
   const [isLoading, setIsLoading] = useState(true);
@@ -38,6 +40,13 @@ export default function VideoPlayer() {
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
 
+  const destroyHls = () => {
+    if (hlsRef.current) {
+      hlsRef.current.destroy();
+      hlsRef.current = null;
+    }
+  };
+
   useEffect(() => {
     const controller = new AbortController();
 
@@ -48,6 +57,7 @@ export default function VideoPlayer() {
 
         const response = await fetch(API_URL, {
           signal: controller.signal,
+          cache: "no-store",
           headers: {
             Accept: "application/json",
           },
@@ -96,12 +106,71 @@ export default function VideoPlayer() {
   useEffect(() => {
     if (!selectedMatch) return;
 
-    const nextStream = selectedMatch.all_resolutions?.[selectedQuality] || pickDefaultStream(selectedMatch);
+    const nextStream =
+      selectedMatch.all_resolutions?.[selectedQuality] || pickDefaultStream(selectedMatch);
     setStreamUrl(nextStream);
     setPlaybackError("");
     setCurrentTime(0);
     setDuration(0);
   }, [selectedMatch, selectedQuality]);
+
+  useEffect(() => {
+    const video = playerRef.current;
+    if (!video || !streamUrl) return;
+
+    destroyHls();
+    setPlaybackError("");
+
+    const canPlayNativeHls =
+      video.canPlayType("application/vnd.apple.mpegurl") !== "";
+
+    if (canPlayNativeHls) {
+      video.src = streamUrl;
+      video
+        .play()
+        .catch(() => {
+          // Browser autoplay policies can block play until user interaction.
+        });
+      return;
+    }
+
+    if (Hls.isSupported()) {
+      const hls = new Hls({
+        enableWorker: true,
+        lowLatencyMode: true,
+      });
+
+      hlsRef.current = hls;
+      hls.loadSource(streamUrl);
+      hls.attachMedia(video);
+
+      hls.on(Hls.Events.MANIFEST_PARSED, () => {
+        video
+          .play()
+          .catch(() => {
+            // Browser autoplay policies can block play until user interaction.
+          });
+      });
+
+      hls.on(Hls.Events.ERROR, (_event, data) => {
+        if (data?.fatal) {
+          setPlaybackError(
+            "Playback failed for this stream right now. Try another match or quality."
+          );
+        }
+      });
+
+      return;
+    }
+
+    setPlaybackError("Your browser does not support HLS playback.");
+  }, [streamUrl]);
+
+  useEffect(() => {
+    return () => {
+      destroyHls();
+    };
+  }, []);
 
   return (
     <section className="w-full px-6 py-10 md:px-14">
@@ -116,11 +185,10 @@ export default function VideoPlayer() {
             <div className="overflow-hidden rounded-xl bg-black">
               <video
                 ref={playerRef}
-                key={streamUrl}
-                src={streamUrl}
                 controls
                 autoPlay
                 playsInline
+                crossOrigin="anonymous"
                 poster={selectedMatch?.image}
                 className="h-full w-full"
                 onLoadedMetadata={(event) => setDuration(event.currentTarget.duration || 0)}
@@ -187,7 +255,11 @@ export default function VideoPlayer() {
                       type="button"
                       onClick={() => {
                         setSelectedMatchId(match.match_id);
-                        setSelectedQuality("1080p");
+                        setSelectedQuality(
+                          match.all_resolutions?.["1080p"]
+                            ? "1080p"
+                            : Object.keys(match.all_resolutions || {})[0] || "1080p"
+                        );
                       }}
                       className={`w-full rounded-lg border p-3 text-left transition ${
                         active
